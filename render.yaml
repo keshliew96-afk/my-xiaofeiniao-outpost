@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: xiaofeiniao-outpost
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: OUTPOST_SECRET
+        sync: false
+      - key: DASH_PASSWORD
+        sync: false
+      - key: DISCORD_ALERT_WEBHOOK
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
