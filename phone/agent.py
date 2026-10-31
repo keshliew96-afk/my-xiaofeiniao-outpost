@@ -75,6 +75,26 @@ def battery():
         return {}
 
 
+def decompress(data, encoding):
+    """urllib hands back the raw body; some servers (B站's comment server) deflate it without being asked."""
+    import gzip
+    import zlib
+    enc = (encoding or "").lower()
+    try:
+        if "gzip" in enc or data[:2] == b"\x1f\x8b":
+            return gzip.decompress(data)
+        if "deflate" in enc:
+            try:
+                return zlib.decompress(data)
+            except zlib.error:
+                return zlib.decompress(data, -15)
+        if "br" in enc:
+            return data   # brotli isn't in the standard library; we never ask for it
+    except Exception:
+        pass
+    return data
+
+
 def do_fetch(job):
     url = job.get("url", "")
     parts = urllib.parse.urlsplit(url)
@@ -89,7 +109,8 @@ def do_fetch(job):
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
-            data = resp.read(FETCH_MAX_BYTES + 1)
+            data = resp.read(4 * FETCH_MAX_BYTES)
+            data = decompress(data, resp.headers.get("content-encoding", ""))
             ctype = resp.headers.get("content-type", "")
             charset = resp.headers.get_content_charset() or "utf-8"
             return {"status": resp.status, "url": resp.geturl(), "content_type": ctype,
