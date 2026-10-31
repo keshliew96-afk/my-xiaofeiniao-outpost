@@ -35,6 +35,19 @@ the bird re-sends everything with her next report, and subscriptions are renewed
 6. YouTube subscriptions need nothing from you: the bird sends her followed channel ids, the outpost
    subscribes and renews. The dashboard lists them with 已订阅 once Google verified them.
 
+## The home phone (`phone/agent.py`)
+
+A spare Android phone on the owner's home Wi-Fi runs `agent.py` in Termux. It long-polls `/phone/jobs`
+and posts results to `/phone/result`, so pages can be fetched from a residential IP (B站 refuses both
+bot-hosting's and Render's datacentre IPs). `/fetch` uses the phone automatically while it's online
+(`via=auto`), else Render. The dashboard shows the phone's last poll and battery; the watchdog alerts
+when it drops.
+
+Phone setup (done once over SSH): Termux + Termux:Boot + Termux:API from F-Droid, `pkg install openssh
+python termux-api`, `~/.outpost-agent.env` with `OUTPOST_URL` and `OUTPOST_SECRET`, and
+`~/.termux/boot/start.sh` that runs `termux-wake-lock`, `sshd` and the agent at boot. Battery
+optimisation off for the three Termux apps; Android's phantom-process limit disabled over adb.
+
 ## Free-tier rules
 
 - 750 instance-hours a month per account, shared by all free web services. One service kept awake
