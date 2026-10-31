@@ -56,7 +56,12 @@ state = {
     "outage_since": 0.0,
     "alerts": deque(maxlen=20),    # (time, text) shown on the dashboard
     "log": deque(maxlen=60),       # (time, text) the outpost's own notes
+    "phone": {"last_seen": 0.0, "battery": {}, "jobs": deque(), "done": 0, "failed": 0},   # the home phone (phone/agent.py)
 }
+_phone_wake = asyncio.Event()      # set when a job is queued, so the phone's long-poll returns at once
+_phone_results = {}                # job id -> {"event", "result"}
+_job_seq = 0
+PHONE_ONLINE_AFTER = 90            # seconds since its last poll
 _event_seq = 0
 
 
@@ -95,7 +100,7 @@ def require_dash(auth):
 @app.get("/health")
 async def health():
     ago = time.time() - state["last_report"] if state["last_report"] else None
-    return {"ok": True, "bot_seen_seconds_ago": None if ago is None else round(ago),
+    return {"ok": True, "bot_seen_seconds_ago": None if ago is None else round(ago), "phone_online": phone_online(),
             "uptime_seconds": round(time.time() - started), "pending_events": len(state["events"])}
 
 
@@ -122,12 +127,13 @@ async def report(request: Request, x_outpost_secret: str = Header(default="")):
         gone = now - state["outage_since"]
         await alert(f"🐦 鸟鸟回来了（掉线了 {int(gone // 60)} 分钟）")
     return {"events": list(state["events"]), "public_url": PUBLIC_URL,
-            "subs": {c: s.get("verified", 0) > 0 for c, s in state["subs"].items()}}
+            "subs": {c: s.get("verified", 0) > 0 for c, s in state["subs"].items()},
+            "phone": {"online": phone_online(), "battery": state["phone"]["battery"]}}
 
 
 @app.get("/fetch")
 async def fetch(url: str = Query(...), accept: str = Query("text/html,application/xml,application/json,text/plain"),
-                x_fetch_cookie: str = Header(default=""), x_outpost_secret: str = Header(default="")):
+                via: str = Query("auto"), x_fetch_cookie: str = Header(default=""), x_outpost_secret: str = Header(default="")):
     """Fetch a public page from here (Render's IP) and hand back the text. Private addresses are
     refused so the relay can't be pointed at anything internal. A login cookie travels in the
     X-Fetch-Cookie header, never the query string, so it stays out of the access log."""
@@ -138,6 +144,17 @@ async def fetch(url: str = Query(...), accept: str = Query("text/html,applicatio
         raise HTTPException(400, "http(s) URLs only")
     if _private_host(parts.hostname):
         raise HTTPException(400, "private address refused")
+    if via == "phone" or (via == "auto" and phone_online()):
+        # The home phone fetches from a residential IP; "auto" uses it whenever it's there.
+        if not phone_online():
+            raise HTTPException(503, "phone offline")
+        result = await phone_run({"kind": "fetch", "url": url, "accept": accept, "cookie": cookie}, timeout=28)
+        if result is None:
+            raise HTTPException(504, "phone did not answer in time")
+        if result.get("error"):
+            raise HTTPException(502, f"phone: {result['error']}")
+        result["via"] = "phone"
+        return result
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                              "Chrome/124.0 Safari/537.36", "Accept": accept, "Accept-Language": "zh-CN,zh;q=0.9"}
     if cookie:
@@ -159,7 +176,7 @@ async def fetch(url: str = Query(...), accept: str = Query("text/html,applicatio
                 text = bytes(data).decode(enc, errors="ignore")
                 return {"status": resp.status_code, "url": final,
                         "content_type": resp.headers.get("content-type", ""), "text": text,
-                        "truncated": len(data) > FETCH_MAX_BYTES}
+                        "truncated": len(data) > FETCH_MAX_BYTES, "via": "render"}
     except HTTPException:
         raise
     except Exception as e:
@@ -178,6 +195,70 @@ def _private_host(host):
         except Exception:
             return False   # unresolvable: let the fetch fail on its own
     return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+
+
+# ---------------------------------------------------------------------------
+# The home phone (phone/agent.py): it long-polls for jobs and posts results.
+# ---------------------------------------------------------------------------
+def phone_online():
+    return time.time() - state["phone"]["last_seen"] < PHONE_ONLINE_AFTER
+
+
+async def phone_run(job, timeout=28):
+    """Queue a job for the phone and wait for its result (None on timeout)."""
+    global _job_seq
+    _job_seq += 1
+    job = {"id": _job_seq, "at": time.time(), **job}
+    slot = {"event": asyncio.Event(), "result": None}
+    _phone_results[job["id"]] = slot
+    state["phone"]["jobs"].append(job)
+    _phone_wake.set()
+    try:
+        await asyncio.wait_for(slot["event"].wait(), timeout)
+    except asyncio.TimeoutError:
+        state["phone"]["failed"] += 1
+    finally:
+        _phone_results.pop(job["id"], None)
+    return slot["result"]
+
+
+@app.post("/phone/jobs")
+async def phone_jobs(request: Request, x_outpost_secret: str = Header(default="")):
+    """The phone's long-poll: {"battery": {...}, "wait": seconds}. Answers as soon as a job exists."""
+    require_secret(x_outpost_secret)
+    body = await request.json()
+    ph = state["phone"]
+    first = not phone_online()
+    ph["last_seen"] = time.time()
+    if isinstance(body.get("battery"), dict):
+        ph["battery"] = body["battery"]
+    if first:
+        note("phone connected")
+    wait = min(float(body.get("wait") or 20), 25)
+    if not ph["jobs"]:
+        _phone_wake.clear()
+        try:
+            await asyncio.wait_for(_phone_wake.wait(), wait)
+        except asyncio.TimeoutError:
+            pass
+    jobs = list(ph["jobs"])
+    ph["jobs"].clear()
+    ph["last_seen"] = time.time()
+    return {"jobs": jobs}
+
+
+@app.post("/phone/result")
+async def phone_result(request: Request, x_outpost_secret: str = Header(default="")):
+    require_secret(x_outpost_secret)
+    body = await request.json()
+    slot = _phone_results.get(body.get("id"))
+    state["phone"]["last_seen"] = time.time()
+    if slot is None:
+        return {"late": True}
+    slot["result"] = body.get("result") if isinstance(body.get("result"), dict) else {"error": "bad result"}
+    slot["event"].set()
+    state["phone"]["done"] += 1
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +382,13 @@ async def watchdog():
             state["offline_alerted"] = True
             state["outage_since"] = state["last_report"]
             await alert(f"⚠️ 鸟鸟掉线了：{int((now - state['last_report']) // 60)} 分钟没有心跳（{sgt(state['last_report'])} 最后一次）")
+        ph = state["phone"]
+        if ph["last_seen"] and not phone_online() and not ph.get("alerted"):
+            ph["alerted"] = True
+            await alert(f"📱 家里的手机掉线了（{sgt(ph['last_seen'])} 最后一次）")
+        elif phone_online() and ph.get("alerted"):
+            ph["alerted"] = False
+            await alert("📱 家里的手机回来了")
         for cid, sub in list(state["subs"].items()):
             if sub["verified"] and sub["expires"] - now < 86400 and now - sub["requested"] > 600:
                 await ensure_subscriptions([cid])
@@ -368,6 +456,7 @@ pre{{white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:420px;o
 <div class=card><h2>无聊条</h2>{bars}</div>
 <div class=card><h2>关注</h2><ul>{rows(snap.get('follows') or [])}</ul><h2 style="margin-top:10px">YouTube 推送订阅</h2><ul>{subs}</ul></div>
 <div class=card><h2>待鸟鸟领取的事件（{len(state['events'])}）</h2><ul>{events}</ul><h2 style="margin-top:10px">掉线记录</h2><ul>{alerts}</ul></div>
+<div class=card><h2>家里的手机</h2><p>{'<span class=status>在线</span>' if phone_online() else '<span class=status style="background:var(--bad)">掉线</span>'} 最后一次 {ago(state['phone']['last_seen'])}，电量 {e(str(state['phone']['battery'].get('percent', '?')))}%（{e(str(state['phone']['battery'].get('status', '')))}），做过 {state['phone']['done']} 件事，超时 {state['phone']['failed']} 次</p></div>
 <div class=card><h2>前哨日志</h2><ul>{notes or '<li class=dim>（无）</li>'}</ul><p class=dim>前哨开机 {ago(started)}，公网地址 {e(PUBLIC_URL or '未知')}</p></div>
 </div>
 <div class=card style="margin-top:12px"><h2>鸟鸟最近的日志（最后 {len(snap.get('trace') or [])} 行）</h2><pre>{trace}</pre></div>
